@@ -1,65 +1,50 @@
-//! The HTTP/1.1 client wire layer, written once for every engine that speaks it.
+//! The HTTP/1.1 client wire layer, written once for every engine that
+//! speaks it.
 //!
-//! # Why this module exists
+//! `websearch` and `onioncrawler` both fetch over HTTP. Keeping one copy of
+//! the wire layer means each of these is fixed, and tested, in one place:
 //!
-//! `websearch::httpclient` and `onioncrawler::http` used to be two
-//! independently-maintained copies of the same code: the same buffered reader,
-//! the same `decode_chunked`, the same streaming `read_chunked`, the same
-//! `parse_headers`, the same `Headers`, the same `build_request`, the same
-//! `Content-Encoding` handling. The duplication was not cosmetic — it was the
-//! largest single source of defects in the workspace. An audit found four
-//! *shapes* of bug in that layer, and **each one existed twice, because the code
-//! existed twice**:
+//! 1. **Chunk-size overflow.** `out.len() + size > cap`, with `size` the
+//!    peer's hex chunk header, wraps for `ffffffffffffffff` and passes. The
+//!    cap arithmetic goes through [`crate::budget::Budget`], which has no `+`
+//!    to overflow.
+//! 2. **CRLF injection through a truncated code point.** Writing the request
+//!    target with `c as u8` turns U+010D into CR and U+010A into LF, so a
+//!    crawled link could inject headers or smuggle a second request onto a
+//!    keep-alive socket. [`build_request`] percent-encodes instead.
+//! 3. **Bare-LF header smuggling.** Splitting the head on CRLF leaves a lone
+//!    LF inside the previous value, and an `ETag` is replayed as
+//!    `If-None-Match` on the next conditional GET. [`parse_headers`] splits on
+//!    LF and strips a trailing CR.
+//! 4. **Quadratic header parsing.** Joining duplicates by scanning the list is
+//!    O(headers²): a head full of tiny headers cost about a second of CPU per
+//!    response. [`parse_headers`] keeps a name→slot index, as a local rather
+//!    than a field on [`Headers`], which is held across `.await` points all
+//!    down the fetch path (making it bigger once overflowed a debug build's
+//!    future stack).
 //!
-//! 1. **The chunked-size integer overflow.** `out.len() + size > cap`, where
-//!    `size` is the peer's hex chunk header: a declared `ffffffffffffffff` wraps
-//!    the sum to a small value that *passes* the check, and the reader is then
-//!    handed an unbounded length — 3 MB of wire measured into 529 MB of RSS in
-//!    0.6 s, and a panic in debug. The cap arithmetic now goes through
-//!    [`crate::budget::Budget`], which does not expose a `+` to overflow.
-//! 2. **CRLF injection through a truncated code point.** The request target was
-//!    written out with `c as u8`, so U+010D became a raw CR and U+010A a raw LF:
-//!    a crawled `<a href="/x\u{010d}\u{010a}X-Injected: 1">` injected a header
-//!    line, and a doubled pair smuggled a whole second request onto a keep-alive
-//!    socket. [`build_request`] percent-encodes instead.
-//! 3. **Bare-LF header smuggling.** Splitting the head on CRLF left a lone LF
-//!    *inside* the preceding value — and an `ETag` is stored and replayed as
-//!    `If-None-Match` on the next conditional GET, so that was a persistent,
-//!    cross-run injection. [`parse_headers`] splits on LF and strips a trailing
-//!    CR.
-//! 4. **The quadratic header parse.** Joining a duplicate key by scanning the
-//!    accumulated list made a head O(headers²): an origin filling the head cap
-//!    with tens of thousands of one-byte headers cost about a second of crawler
-//!    CPU per response, free, on every page it served. [`parse_headers`] keeps a
-//!    name→slot index — as a *local*, never as a field on [`Headers`], which is
-//!    held across `.await` points all the way down the fetch path (widening it
-//!    once overflowed a debug-build future's stack).
+//! The tests for all four are at the bottom of this file. The engines keep
+//! only what really differs: `websearch` its SSRF gate (`vet_addrs`/`SafeIp`,
+//! the DNS cache, the pinned connect, redirects, the keep-alive `Fetcher`),
+//! `onioncrawler` its SOCKS/Tor transport and the `OnionHost` gate.
 //!
-//! Each of those had to be found twice, fixed twice and regression-tested twice.
-//! The next framing bug would have landed twice as well. So the wire layer lives
-//! here, once; the regression tests for all four shapes are at the bottom of
-//! this file; and the engines keep only what genuinely differs between them —
-//! `websearch` its SSRF gate (`vet_addrs`/`SafeIp`, the DNS cache, the pinned
-//! connect, redirects, the keep-alive `Fetcher`), `onioncrawler` its SOCKS/Tor
-//! transport and the `OnionHost` darknet gate.
+//! # Two decompression conventions
 //!
-//! # Two decompression conventions, kept on purpose
-//!
-//! The one place the two copies had genuinely diverged is what to do with a
-//! `Content-Encoding` body that does not decode, and how the cap is expressed.
-//! Both behaviours survive, named, as [`decompress_or_raw`] (never fails; an
-//! undecodable body is used verbatim) and [`decompress_checked`] (an undecodable
-//! declared encoding is a protocol error), selected on the wire path by
-//! `ContentEncodingPolicy` (behind the `net` feature). Silently picking one
-//! would have changed what an engine stores for a malformed origin, which is
-//! exactly the kind of change the byte-identity goldens exist to catch.
+//! What to do with a `Content-Encoding` body that doesn't decode differs
+//! between the engines, so both behaviours exist, by name:
+//! [`decompress_or_raw`] (never fails; an undecodable body is used as is) and
+//! [`decompress_checked`] (an undecodable declared encoding is a protocol
+//! error), chosen on the wire path by `ContentEncodingPolicy` (behind the
+//! `net` feature). Picking one silently would change what an engine stores
+//! for a malformed origin, which the byte-identity goldens would catch.
 //!
 //! # Feature tiers
 //!
-//! Everything above the `net` line is pure and compiles with **no features** and
-//! no third-party dependencies. Only the streaming reader (`perform_request`
-//! and the chunked body reader behind it) needs `tokio::io::AsyncRead`, so it
-//! sits behind the opt-in `net` feature, like the net tiers of the engines.
+//! Everything above the `net` line is pure and compiles with **no features**
+//! and no third-party dependencies. Only the streaming reader
+//! (`perform_request` and the chunked body reader behind it) needs
+//! `tokio::io::AsyncRead`, so it is behind the opt-in `net` feature, like the
+//! engines' net tiers.
 
 use crate::inflate::{inflate_gzip, inflate_raw, inflate_zlib};
 use std::fmt;
@@ -130,17 +115,14 @@ fn header_safe(v: &str) -> String {
         .collect()
 }
 
-/// Percent-encode a request target so it is guaranteed to be a single ASCII
-/// token. Paths arrive canonicalised, i.e. already percent-encoded, so existing
-/// `%XX` and reserved characters pass through untouched; what gets escaped is
-/// exactly what may not appear literally in a request line — SP, the CTLs (CR
-/// and LF above all) and every non-ASCII byte.
+/// Percent-encode a request target so it is always a single ASCII token.
+/// Paths arrive canonicalised (already percent-encoded), so existing `%XX`
+/// and reserved characters pass through; what gets escaped is exactly what
+/// may not appear literally in a request line: SP, the CTLs (CR and LF above
+/// all) and every non-ASCII byte.
 ///
-/// Writing the code point out with `c as u8` instead — what this did before —
-/// TRUNCATED it: U+010D became a raw CR and U+010A a raw LF, so a crawled
-/// `<a href="/x\u{010d}\u{010a}X-Injected: 1">` injected a header line, and a
-/// doubled pair smuggled a whole second request onto a keep-alive socket. It
-/// also silently mangled every non-Latin-1 IRI.
+/// Writing a code point as `c as u8` would truncate it: U+010D becomes a raw
+/// CR and U+010A a raw LF, enough to inject a header line from a crawled link.
 fn encode_request_target(path: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(path.len());
@@ -244,18 +226,16 @@ pub fn parse_status_line(line: &[u8]) -> Result<(String, u16, String), HttpError
 pub fn parse_headers(block: &[u8]) -> Headers {
     let mut headers = Headers::default();
     let text = latin1_decode(block);
-    // `at` maps a header name to its slot so a duplicate is joined in O(1). The
-    // scan used to be linear per header, making a head O(headers²): an origin
-    // filling the head cap with tens of thousands of one-byte headers cost about
-    // a second of crawler CPU per response, free, on every page it served. It
-    // lives here rather than inside `Headers` so the struct — which is held
-    // across `.await` points all down the fetch path — does not grow (widening
-    // it overflowed a debug-build future's stack).
+    // `at` maps a header name to its slot, so a duplicate is joined in O(1)
+    // rather than by scanning (which made a head O(headers²)). It's a local, not
+    // a field of `Headers`: that struct is held across `.await` points all down
+    // the fetch path, and making it bigger once overflowed a debug build's
+    // future stack.
     let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    // Split on LF and drop a trailing CR, rather than splitting on CRLF: a
-    // header line terminated by a BARE LF used to leave that LF *inside* the
-    // preceding value, and values like `ETag` are stored and replayed on the
-    // next conditional GET — a persistent, cross-run header injection.
+    // Split on LF and drop a trailing CR, rather than splitting on CRLF: a line
+    // ending in a bare LF would otherwise leave that LF inside the previous
+    // value, and values like `ETag` are stored and replayed on the next
+    // conditional GET.
     for raw in text.split('\n') {
         let raw = raw.strip_suffix('\r').unwrap_or(raw);
         if raw.is_empty() || !raw.contains(':') {
@@ -903,18 +883,16 @@ mod tests {
         );
     }
 
-    /// `max_bytes + 1` at the top of the range used to be a literal `+`, which
-    /// panics in debug and wraps to a zero cap in release.
+    /// `max_bytes + 1` at the top of the range must not overflow (a plain `+`
+    /// panics in debug and wraps to a zero cap in release).
     #[test]
     fn an_absurd_cap_does_not_overflow_the_or_raw_limit() {
         assert_eq!(decompress_or_raw(b"raw", "identity", usize::MAX), b"raw");
     }
 }
 
-/// The four defects this module was created to stop having to fix twice. Each
-/// one was found, fixed and regression-tested independently in
-/// `websearch::httpclient` and in `onioncrawler::http`; from here there is one
-/// copy of the code and one copy of the test.
+/// Regression tests for the four wire-layer bugs described in the module
+/// docs.
 #[cfg(test)]
 mod audit_regression {
     use super::*;
@@ -977,8 +955,8 @@ mod audit_regression {
         assert_eq!(text.matches("\r\n\r\n").count(), 1, "{text:?}");
     }
 
-    /// A header line terminated by a BARE LF used to leave that LF inside the
-    /// preceding value, which is then stored and replayed.
+    /// A header line ending in a bare LF must not leave that LF in the previous
+    /// value, which is stored and replayed.
     #[test]
     fn a_bare_lf_terminates_a_header_line() {
         let h = parse_headers(b"ETag: \"a\"\nX-Next: b\r\n");
@@ -986,52 +964,25 @@ mod audit_regression {
         assert_eq!(h.get("x-next"), Some("b"));
     }
 
-    /// Parsing a head was O(headers²): an origin filling the head cap with tens
-    /// of thousands of one-byte headers cost ~1 s of crawler CPU per response.
+    /// Parsing a head must be linear in the number of headers; a quadratic parse
+    /// cost ~1 s of CPU per response on a head full of tiny headers.
     ///
-    /// What is asserted is how the cost SCALES with the size of one head, not how
-    /// long any parse took. The two sides parse the SAME 8 000 headers — four
-    /// blocks of 2 000 against one block of 8 000 — so a linear parse costs the
-    /// same on both and the ratio is 1, while a quadratic one costs
-    /// `8000²/(4·2000²) = 4` times more on the single big block.
+    /// The test asserts how the cost scales, not how long a parse takes. Both
+    /// sides parse the same 8 000 headers, as four heads of 2 000 or one head of
+    /// 8 000, so a linear parse gives a ratio of 1 and a quadratic one
+    /// `8000²/(4·2000²) = 4`.
     ///
-    /// What makes the ratio survive a loaded runner is the best-of-9 minimum
-    /// below, not any cancellation between the two sides. Contention does not
-    /// cancel out of a quotient: an extra `d` on both sides gives `(L+d)/(S+d)`,
-    /// which is not `L/S` but drifts toward 1, and in practice the perturbations
-    /// are independent, so they do not even land on both sides. Both effects were
-    /// observed here — a run whose small-side minimum was inflated to 22.3 ms
-    /// against a typical 13.5–14.5 ms read 0.711, and a run that caught the large
-    /// side instead read 1.426. What bounds them is that a preemption can only
-    /// ever inflate a sample, so the minimum of nine is the reading closest to the
-    /// work itself, and it only takes one of the nine to run cleanly. Matching the
-    /// two sides' durations (~14 ms each) is still worth doing — it keeps the two
-    /// minima comparable estimators — but it is not what carries the test.
+    /// Noise is handled by taking the minimum of nine runs per side: preemption
+    /// can only make a sample slower, so the minimum is the closest reading to
+    /// the work itself, and only one of nine has to run cleanly. (Noise doesn't
+    /// cancel out in a ratio.) Measured over 16 runs under heavy CPU load on two
+    /// cores: 1.05–1.43 for the real parser (one outlier at 0.71), 4.13–4.30 for a
+    /// quadratic one. The bar of 2.5 sits well clear of both.
     ///
-    /// Measured over 16 runs of the whole `--lib` binary under a 16-way CPU load
-    /// on this 2-core box: 1.046–1.426, with the one 0.711 above. Reverting
-    /// `parse_headers` to the linear duplicate scan gives 4.13–4.30 and fails 6 of
-    /// 6 — the predicted 4. The bar of 2.5 sits 1.75× above the worst reading a
-    /// correct parse gave and 1.65× below the best the defect gave.
-    ///
-    /// What this cannot rule out: the two sides have different working sets, 2 000
-    /// rows against 8 000, so a `Vec<(String, String)>` of about 94 KB against
-    /// about 375 KB before the strings themselves. On a machine where the large
-    /// side spills a cache level the small side fits inside, a CORRECT parse's
-    /// ratio rises for a reason that has nothing to do with the exponent. It does
-    /// not happen here — this box has 32 KB of L1d and 1 MB of L2, so both sides
-    /// miss L1 and both fit L2, which is why the readings sit near 1.05 — but a
-    /// box with a 256 KB L2 would straddle the tiers. The margin is what absorbs
-    /// that: the defect this names lands at ~4.2, not at 1.5.
-    ///
-    /// The bound was `elapsed() < 2 s` on a single 20 000-header parse, which was
-    /// wrong in both directions. It sat only 4.3× above what a CORRECT parse
-    /// measured — 62 ms idle, 464 ms under load on two cores — so a runner four
-    /// times slower than this one failed it for no reason. And it barely
-    /// discriminated against the defect it names: the quadratic parse cost about
-    /// 1 s, so a regression landing anywhere under 2 s passed. A ratio has no
-    /// such blind spot, because what it measures is the exponent rather than the
-    /// machine.
+    /// Not ruled out: the sides have different working sets (about 94 KB against
+    /// 375 KB of rows), so on a machine where only the small side fits in cache, a
+    /// correct parser's ratio rises for reasons unrelated to the exponent. The
+    /// margin absorbs that: the defect lands at ~4.2, not 1.5.
     #[test]
     fn many_headers_parse_in_linear_time() {
         // `h0: v\r\n`, `h1: v\r\n`, … — the shape an origin fills the head with.

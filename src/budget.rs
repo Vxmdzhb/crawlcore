@@ -1,24 +1,18 @@
-//! A size budget that cannot be overflowed — the type form of "cap this read".
+//! A size budget that can't be overflowed: "cap this read", as a type.
 //!
-//! # Why this exists
-//!
-//! Every engine in the suite had the same bug, five times over, in five
-//! separately-written chunked-body readers:
+//! The classic chunked-body bug:
 //!
 //! ```text
 //! if out.len() + size > cap { … }     // `size` is the peer's hex chunk header
 //! ```
 //!
-//! `size` is attacker-controlled and can be `usize::MAX`, so the **sum wraps**
-//! to something small, passes the check, and the read is then handed an
-//! unbounded length. In release that buffers until the socket idles — one
-//! measured case turned 3 MB of wire into 529 MB of RSS in 0.6 s, another was
-//! OOM-killed outright; in debug it panics the task.
+//! `size` comes from the peer and can be `usize::MAX`, so the **sum wraps**
+//! to something small, passes the check, and the read gets an unbounded
+//! length. In release that buffers until the socket goes idle (3 MB of wire
+//! measured as 529 MB of memory in 0.6 s); in debug it panics.
 //!
-//! Each site was fixed by hand. That leaves the *shape* available to the next
-//! reader anyone writes, so the shape is what this module removes: a [`Budget`]
-//! never exposes the arithmetic. You ask it how much you may take, and it
-//! answers with a number that is always within what remains.
+//! A [`Budget`] never exposes the arithmetic. You ask how much you may take,
+//! and the answer is always within what remains.
 //!
 //! ```
 //! # use crawlcore::budget::Budget;
@@ -30,15 +24,14 @@
 //! assert!(b.overrun());             // and we know the peer asked for too much
 //! ```
 //!
-//! The rule of thumb: if a number reaching an allocation or a read length came
-//! off the wire, it should pass through a `Budget` rather than through `+` and
-//! `>`.
+//! Rule of thumb: a number from the wire that reaches an allocation or a read
+//! length goes through a `Budget`, not through `+` and `>`.
 
-/// A remaining-bytes budget. Construct with the cap, then [`take`](Budget::take)
-/// against it; the arithmetic is saturating and unobservable.
+/// A remaining-bytes budget. Construct it with the cap, then
+/// [`take`](Budget::take) from it; the arithmetic is saturating and hidden.
 ///
-/// `Budget` is deliberately **not** `Copy`: a budget that can be silently
-/// duplicated is a budget that can be silently spent twice.
+/// `Budget` is deliberately **not** `Copy`: a budget that can be duplicated
+/// can be spent twice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Budget {
     remaining: usize,
@@ -131,8 +124,8 @@ impl Budget {
 mod tests {
     use super::*;
 
-    /// The bug this type exists to make unrepresentable: `out.len() + size`
-    /// wrapping past a cap when `size` is the peer's declared chunk length.
+    /// `out.len() + size` must not wrap past the cap when `size` is the peer's
+    /// declared chunk length.
     #[test]
     fn an_absurd_request_gets_only_what_remains() {
         let mut b = Budget::new(1024);
@@ -144,8 +137,8 @@ mod tests {
         assert_eq!(b.remaining(), 0);
     }
 
-    /// The equivalent of the old `out.len() + size > cap` check, done safely:
-    /// a sequence of chunks that together exceed the cap is cut at the cap.
+    /// `out.len() + size > cap`, done safely: chunks that together exceed the cap
+    /// are cut at the cap.
     #[test]
     fn a_sequence_of_chunks_is_cut_at_the_cap_not_after_it() {
         let mut b = Budget::new(10);

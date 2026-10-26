@@ -109,7 +109,7 @@ pub fn unquote_plus(s: &str) -> String {
 // --- query strings ----------------------------------------------------------
 
 /// `urllib.parse.parse_qsl(qs, keep_blank_values=…)` with the default `&`
-/// separator (modern CPython no longer splits on `;`). Values are
+/// separator (current CPython no longer splits on `;`). Values are
 /// `unquote_plus`-decoded; empty pairs are skipped.
 #[must_use]
 pub fn parse_qsl(qs: &str, keep_blank_values: bool) -> Vec<(String, String)> {
@@ -217,13 +217,10 @@ fn sanitize(url: &str) -> String {
         .chars()
         .filter(|&c| c != '\t' && c != '\r' && c != '\n')
         .collect();
-    // LEADING only, deliberately. `urlsplit` says so in as many words — "Only
-    // lstrip url as some applications rely on preserving trailing space" — and
-    // trimming the right-hand end too (what this used to do) collapsed distinct
-    // URLs onto one canonical form: `http://h/a  ` and `http://h/a\0` both
-    // became `http://h/a`, so dedup and index keys stopped matching the
-    // reference. It was the single largest divergence class in the URL corpus,
-    // 250 of 4039 cases.
+    // Leading only, on purpose, as `urlsplit` does ("Only lstrip url as some
+    // applications rely on preserving trailing space"). Trimming the end too
+    // would merge distinct URLs (`http://h/a  ` and `http://h/a\0` would both
+    // become `http://h/a`) and break dedup against the reference.
     stripped
         .trim_start_matches(|c: char| (c as u32) <= 0x20)
         .to_string()

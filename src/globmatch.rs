@@ -135,7 +135,7 @@ mod tests {
         glob_match(&segs, anchored, path)
     }
 
-    /// The old regex translation, used ONLY as a correctness oracle.
+    /// A regex translation of the glob, used only as a correctness oracle.
     fn regex_ref(pattern: &str, path: &str) -> bool {
         // Hand-rolled equivalent of re.match("^" + translate(body) + ("$"|""))
         // to avoid a regex dependency in the test.
@@ -204,38 +204,28 @@ mod tests {
 
     /// `/a*a*a*…$` against 500 `a`s is the input a backtracking matcher dies on:
     /// 51 segments, and a regex engine explores a number of paths exponential in
-    /// that. What is asserted is the number of scans of the path, because that
-    /// is the property — one per segment, none of them ever repeated.
+    /// that. The test counts scans of the path, because that's the property: one
+    /// per segment, none repeated. (A wall-clock bound would measure the runner,
+    /// not the matcher: the real matcher takes microseconds, a backtracking one
+    /// never finishes.)
     ///
-    /// This was `elapsed().as_millis() < 100`, the tightest wall-clock bound in
-    /// the workspace, measured at 92 ms against it under load. The bound could
-    /// not have been measuring the guarded failure anyway: the matcher does about
-    /// 50 scans and returns in microseconds, while backtracking does not take
-    /// 150 ms, it takes 2⁵⁰ steps and never returns. The 92 ms was a scheduler
-    /// preemption, i.e. the test was one quantum from failing on a fact about the
-    /// runner rather than about the matcher.
+    /// Each scan is a single forward `starts_with` / `find` / `ends_with` over
+    /// what's left of the path, which is linear. So at most `segments.len()`
+    /// scans, and at most `segments.len() * path.len()` character comparisons.
     ///
-    /// The scan count bounds the whole matcher because each scan is a single
-    /// forward `starts_with` / `find` / `ends_with` over what is left of the
-    /// path, which the stdlib does in linear time: at most `segments.len()`
-    /// scans, so at most `segments.len() * path.len()` character comparisons.
+    /// The count is pinned with `assert_eq!`, not just bounded from above,
+    /// because zero would satisfy an upper bound. Two mutations that would pass
+    /// `scans <= segments.len()`:
     ///
-    /// The count is pinned with `assert_eq!`, not bounded from above, because an
-    /// upper bound alone is satisfied by zero. Two mutations make that concrete,
-    /// and both pass `scans <= segments.len()`:
-    ///
-    /// * delete the two `note_glob_scan` calls inside the scan loops and leave
-    ///   the one at the top of `glob_match`: `scans` becomes 1 and the counter no
-    ///   longer tracks the loop whose repetitions are the ReDoS risk. Nothing
-    ///   else notices — it is not dead code and clippy is silent under
-    ///   `-D warnings`.
-    /// * replace the matcher with a backtracking one that reports no scans at
-    ///   all: `scans` becomes 0.
+    /// * removing the two `note_glob_scan` calls inside the scan loops (leaving
+    ///   the one at the top of `glob_match`): `scans` becomes 1, and the counter
+    ///   no longer tracks the loop that matters;
+    /// * replacing the matcher with a backtracking one that reports no scans:
+    ///   `scans` becomes 0.
     ///
     /// `segments.len() - 1` rather than `segments.len()`: the pattern ends in
-    /// `*`, so the last segment is empty and `glob_match` returns before the
-    /// third scan site. The documented `segments.len()` is a correct bound, but
-    /// this input never reaches it, so asserting it would be asserting slack.
+    /// `*`, so the last segment is empty and `glob_match` returns before the third
+    /// scan site.
     #[test]
     fn pathological_is_bounded() {
         let (anchored, segments) = compile_glob(&format!("/{}$", "a*".repeat(50)));

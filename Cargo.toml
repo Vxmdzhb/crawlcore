@@ -5,12 +5,8 @@ edition = "2021"
 rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/Vxmdzhb/crawlcore"
-# Not published to crates.io, and the declaration is load-bearing rather than
-# decorative: the suite's crates depend on each other through their git repositories,
-# and cargo-deny counts a versionless path dependency as a wildcard unless the
-# crate says it is unpublishable — because crates.io would reject a path
-# dependency anyway. Saying so here is also the only thing that stops a stray
-# `cargo publish` in one of these directories from reaching the registry.
+# Not published to crates.io: the suite's crates depend on each other
+# through their git repositories, and this also stops a stray `cargo publish`.
 publish = false
 description = "Shared crawl library: robots glob, SimHash dedup, recrawl scheduling, trap predicates, hashing (SHA-1/256, MD5, BLAKE2b), INFLATE, HTTP/1.1 wire layer."
 

@@ -1,30 +1,25 @@
-//! Structured log lines: the `--log-format=json` half of every engine's logging.
+//! Structured log lines: the `--log-format=json` half of every engine's
+//! logging.
 //!
-//! Every engine logs prose to stderr, which is exactly right for a person
-//! watching one server and useless the moment the logs are shipped somewhere and
-//! queried during an incident. This module is the other mode: **one JSON object
-//! per line**, with a machine-readable timestamp, level, engine name, event
-//! name, and the request fields when there is a request.
+//! Engines log prose to stderr, which suits a person watching one server and
+//! is useless once logs are shipped somewhere and queried. This is the other
+//! mode: **one JSON object per line**, with a machine-readable timestamp,
+//! level, engine, event and, for requests, the request fields.
 //!
-//! # Escaping is the whole point
+//! # Escaping is the point
 //!
-//! A log line is attacker-influenced — the request path is whatever the peer
-//! sent — and the suite has already been bitten once by this: a bare `\n` in a
-//! request target used to survive `suitedash`'s request-line split and reach
-//! `eprintln!`, forging a second, entirely attacker-written line in the request
-//! log (see the regression test in `suitedash::server`). A JSON line that
-//! embeds an unescaped newline, quote or control byte has the same defect with a
-//! machine reading it instead of a person: the forged content parses as a real
-//! event, with a timestamp and a level of the attacker's choosing.
+//! Log lines carry attacker-controlled text (the request path is whatever the
+//! peer sent). An unescaped newline, quote or control byte would let that text
+//! forge a whole extra log event, with a timestamp and level of the
+//! attacker's choosing.
 //!
-//! [`escape_into`] therefore escapes `"` and `\`, and **every** byte below
-//! 0x20 — not just the ones with short forms. Non-ASCII is emitted as raw UTF-8,
-//! which RFC 8259 permits and every log shipper expects; escaping it would only
-//! make the lines unreadable.
+//! So [`escape_into`] escapes `"` and `\` and **every** byte below 0x20, not
+//! just those with short forms. Non-ASCII is emitted as raw UTF-8, which
+//! RFC 8259 permits and log shippers expect.
 //!
-//! There is no JSON *writer* elsewhere in the suite ([`crate::json`] parses
-//! only), and the output here is round-tripped through that parser in the tests,
-//! so the two halves cannot disagree about what valid JSON is.
+//! There's no other JSON *writer* in the suite ([`crate::json`] only parses),
+//! and the tests round-trip this output through that parser, so the two can't
+//! disagree about what valid JSON is.
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -33,8 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// How an engine should write its logs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Format {
-    /// Human-readable prose on stderr. The default, byte-identical to what each
-    /// engine printed before this module existed.
+    /// Human-readable prose on stderr. The default.
     #[default]
     Text,
     /// One JSON object per line.
@@ -45,9 +39,8 @@ impl Format {
     /// Parse a `--log-format` value.
     ///
     /// # Errors
-    /// Any value other than `text` or `json`, with a message that names both —
-    /// a typo'd `--log-format=jsonl` must not silently fall back to text and
-    /// leave an operator wondering why their log pipeline is empty.
+    /// Anything other than `text` or `json`, with a message naming both: a typo
+    /// like `--log-format=jsonl` must not silently fall back to text.
     pub fn parse(s: &str) -> Result<Format, String> {
         match s {
             "text" => Ok(Format::Text),
@@ -82,8 +75,7 @@ pub fn set_format(f: Format) {
 }
 
 /// The format this process logs in. Defaults to [`Format::Text`], so a process
-/// that never calls [`set_format`] (an embedder, a test) logs exactly as it did
-/// before this module existed.
+/// that never calls [`set_format`] (an embedder, a test) logs prose.
 #[must_use]
 pub fn format() -> Format {
     if FORMAT.load(Ordering::Relaxed) == 0 {
@@ -354,13 +346,12 @@ pub fn request_line_at(epoch_secs: f64, engine: &str, req: &Request<'_>) -> Stri
         .finish()
 }
 
-/// One request rendered as a **text** access line, in the shape `gitweb` and
-/// `suitedash` already use.
+/// One request as a **text** access line, in the shape `gitweb` and
+/// `suitedash` use.
 ///
-/// The path is passed through [`safe_token`] first. A request target is
-/// attacker-controlled, and this suite has already shipped the bug where a bare
-/// `\n` in one forged a second, entirely attacker-written line in the request
-/// log; the same input must not be able to do it through this function.
+/// The path goes through [`safe_token`] first: a request target is
+/// attacker-controlled, and a bare `\n` in it must not be able to forge a
+/// second log line.
 #[must_use]
 pub fn request_text(req: &Request<'_>) -> String {
     let action = if req.action.is_empty() {
@@ -425,10 +416,9 @@ fn now_secs() -> f64 {
 
 /// Epoch seconds → `YYYY-MM-DDTHH:MM:SS.mmmZ` (UTC).
 ///
-/// UTC and millisecond precision, unconditionally. A log shipper correlating
-/// five engines across three machines cannot do it if each stamps local time
-/// with a different offset, and second precision is too coarse to order the
-/// requests inside one incident.
+/// Always UTC with milliseconds: logs from several engines on several machines
+/// can only be lined up with one time zone, and seconds are too coarse to
+/// order the requests within one incident.
 #[must_use]
 pub fn rfc3339_utc(epoch_secs: f64) -> String {
     let millis_total = (epoch_secs * 1000.0).floor();

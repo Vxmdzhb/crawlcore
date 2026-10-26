@@ -1,26 +1,18 @@
-//! The request-metrics block every engine's `/metrics` shares.
+//! The request-metrics block shared by every engine's `/metrics`.
 //!
-//! `suitedash` polls all five engines and its dashboards key on metric *names*,
-//! so an engine that spells its request counter differently — or does not have
-//! one — is invisible on the status page. Before this module only `gitweb`
-//! exposed request counters at all; `onioncrawler`, `websearch` and `torrentds`
-//! exposed a handful of index gauges, and `suitedash` exposed only what it had
-//! federated from elsewhere. That meant "how many requests is websearch actually
-//! serving, and how many of them are 5xx?" had no answer anywhere in the suite.
+//! `suitedash` polls all five engines, and its dashboards key on metric
+//! *names*, so every engine needs the same request counters under the same
+//! names. [`Requests`] is that block: a lock-guarded set of plain integers, no
+//! background thread, no allocation on the hot path beyond a first-seen
+//! status or action, nothing written to disk. [`Requests::render`] emits
+//! Prometheus text format under a caller-supplied prefix, with the names
+//! `gitweb` established (`<prefix>_requests_total`, `<prefix>_uptime_seconds`,
+//! …), so one query works against any engine with only the prefix changed.
 //!
-//! [`Requests`] is that answer, in one place: a lock-guarded set of plain
-//! integers with no background thread, no allocation on the hot path beyond a
-//! first-seen status/action, and nothing written to disk. [`Requests::render`]
-//! emits Prometheus text exposition format under a caller-supplied prefix, using
-//! the names `gitweb` already established (`<prefix>_requests_total`,
-//! `<prefix>_uptime_seconds`, …) so the dashboards that key on them keep working
-//! and the same query works against any engine with only the prefix changed.
-//!
-//! `gitweb::metrics` deliberately still has its own copy: its output is
-//! cross-checked byte-identical against the retired Python implementation by
-//! `gitweb/tests/xcheck_metrics.rs`, and that contract outranks sharing code.
-//! The names emitted here match it exactly, which is what actually matters to a
-//! dashboard.
+//! `gitweb::metrics` keeps its own copy: its output is cross-checked byte for
+//! byte against the retired Python implementation
+//! (`gitweb/tests/xcheck_metrics.rs`), and that outranks sharing code. The
+//! names match exactly, which is what a dashboard cares about.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -57,10 +49,9 @@ struct Inner {
 
 /// Process-wide request counters for one engine's HTTP server.
 ///
-/// Each engine owns its own instance behind a `OnceLock`, rather than there
-/// being one global here: the `astrx` binary links all five engines into one
-/// process, and a shared global would report gitweb's traffic under websearch's
-/// prefix the moment anything ran two servers side by side.
+/// Each engine owns its instance behind a `OnceLock` rather than sharing one
+/// global: the `astrx` binary links all five engines into one process, and a
+/// shared global would mix their traffic.
 #[derive(Debug)]
 pub struct Requests {
     started: f64,
@@ -153,13 +144,11 @@ impl Requests {
         now_seconds() - self.started
     }
 
-    /// Render the shared block as Prometheus text exposition format, every
-    /// series prefixed with `prefix` (e.g. `websearch`).
+    /// Render the shared block as Prometheus text, every series prefixed with
+    /// `prefix` (e.g. `websearch`).
     ///
-    /// Series are emitted in a fixed order and label sets are sorted, so two
-    /// consecutive scrapes of an idle server produce byte-identical output apart
-    /// from the uptime — a `/metrics` body that reshuffles itself makes diffing
-    /// two scrapes during an incident useless.
+    /// Series come out in a fixed order with sorted label sets, so two scrapes of
+    /// an idle server differ only in the uptime and are easy to diff.
     #[must_use]
     pub fn render(&self, prefix: &str) -> String {
         let g = self.lock();

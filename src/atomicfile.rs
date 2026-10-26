@@ -1,77 +1,62 @@
 //! Publish a file by rename, so a reader never sees a half-written one.
 //!
-//! # Why this exists
+//! `std::fs::write` truncates the destination and then writes. A crash, a
+//! `SIGKILL`, a full disk or a power cut in between leaves a truncated file,
+//! and since the engines rightly refuse to load a corrupt snapshot, the
+//! previous good index is simply gone. No attacker needed, just bad luck
+//! during a save. It's also easy to get subtly wrong by hand (skip the fsync
+//! and the rename can reach the disk before the data, publishing a file of
+//! zeroes), so it lives here, once.
 //!
-//! All four engines persist their index the same way, and all four did it with
-//! `std::fs::write`, which **truncates the destination and then writes**. A
-//! crash, a `SIGKILL`, a full disk or a power cut in that window leaves a
-//! truncated file — and because every engine correctly refuses to load a corrupt
-//! snapshot, the result is that the *previous good index is already gone*.
-//! Measured on an 89 MB snapshot truncated at 5 %, 50 % and 99.9 %: `restore`
-//! returned `None` in all three, and both `index` and `search` then refused to
-//! start.
+//! The sequence:
 //!
-//! This is the worst class of bug in the tree, because unlike everything the
-//! audit found it needs **no attacker at all** — just bad luck during a periodic
-//! save. It is also the easiest to get subtly wrong by hand (forget the fsync
-//! and the rename can beat the data to disk, publishing a file of zeroes), which
-//! is why it lives here once rather than four times.
-//!
-//! The sequence is the standard durable-publish dance:
-//!
-//! 1. write to a uniquely-named temp file **in the same directory** (a rename
-//!    across filesystems is not atomic, and `/tmp` is often a different one);
-//! 2. `sync_all` the data — *before* the rename, so the rename cannot publish
-//!    bytes that never reached the platter;
+//! 1. write to a uniquely named temp file **in the same directory** (a rename
+//!    across filesystems isn't atomic, and `/tmp` is often another one);
+//! 2. `sync_all` the data *before* the rename, so the rename can't publish
+//!    bytes that never reached the disk;
 //! 3. `rename` over the destination, which is atomic on POSIX;
-//! 4. best-effort fsync of the directory, so the rename itself survives a power
-//!    cut.
+//! 4. fsync the directory (best effort), so the rename itself survives a
+//!    power cut.
 //!
-//! On any failure the temp file is removed, so a failing writer never litters
-//! the data directory.
+//! On any failure the temp file is removed, so a failing writer never leaves
+//! debris in the data directory.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// Write `bytes` to `path` atomically: readers see either the old file or the
-/// new one, never a partial one.
+/// Write `bytes` to `path` atomically: readers see the old file or the new
+/// one, never a partial one.
 ///
 /// # Errors
-/// Any I/O error from creating, writing, syncing or renaming the temp file. The
-/// temp file is removed before returning, and `path` is left untouched — so a
-/// failed write costs you the new data, never the old.
+/// Any I/O error from creating, writing, syncing or renaming the temp file.
+/// The temp file is removed first and `path` is left untouched, so a failed
+/// write loses the new data, never the old.
 pub fn write_atomic(path: impl AsRef<Path>, bytes: &[u8]) -> std::io::Result<()> {
     write_atomic_with(path, |w| w.write_all(bytes))
 }
 
-/// The same durable-publish dance as [`write_atomic`], but the caller *streams*
-/// the contents into a writer instead of handing over a finished `&[u8]`.
+/// The same sequence as [`write_atomic`], but the caller *streams* the
+/// contents into a writer instead of handing over a finished `&[u8]`.
 ///
-/// # Why this exists
+/// [`write_atomic`] needs the whole file in memory before the first byte is
+/// written, so publishing N bytes costs N bytes of memory on top of whatever
+/// produced them. Fine for a manifest, wrong for anything corpus-sized:
+/// [`crate::segstore`]'s compaction folds several segments into one, and here
+/// it writes record by record, so peak memory is one record plus the
+/// `BufWriter`.
 ///
-/// [`write_atomic`] requires the whole file in memory before the first byte
-/// reaches the disk, so publishing an N-byte file costs N bytes of RSS on top of
-/// whatever produced it. That is fine for a manifest and wrong for anything
-/// corpus-sized: [`crate::segstore`]'s compaction folds several segments into one
-/// and would otherwise have to buffer the entire merged segment — reintroducing,
-/// inside the very component built to remove it, the "a save briefly doubles
-/// memory" problem. Here the merge writes record by record and peak memory is one
-/// record plus the `BufWriter`.
+/// The atomicity is the same (temp sibling → flush → `sync_all` → `rename` →
+/// directory fsync) because it's the same code: [`write_atomic`] is a
+/// one-line wrapper over this function.
 ///
-/// The atomicity story is identical (temp sibling → flush → `sync_all` →
-/// `rename` → directory fsync), and it is identical *because it is the same
-/// code*: [`write_atomic`] is a one-line wrapper over this function. A second,
-/// hand-rolled copy of the sequence is exactly how the fsync gets forgotten.
-///
-/// `fill` is handed a `&mut dyn Write` (not a generic writer) so this function
-/// monomorphises once no matter how many record types call it.
+/// `fill` gets a `&mut dyn Write` (not a generic writer), so this function is
+/// compiled once however many record types call it.
 ///
 /// # Errors
-/// Any I/O error from creating, writing, flushing, syncing or renaming the temp
-/// file, plus anything `fill` itself returns. In every failure case the temp file
-/// is removed and `path` is left untouched — a failed write costs you the new
-/// data, never the old. Note that `fill` may already have written bytes when it
-/// fails; they die with the temp file and are never published.
+/// Any I/O error from creating, writing, flushing, syncing or renaming the
+/// temp file, plus whatever `fill` returns. On every failure the temp file is
+/// removed and `path` is left untouched. Bytes `fill` wrote before failing
+/// die with the temp file and are never published.
 pub fn write_atomic_with<F>(path: impl AsRef<Path>, fill: F) -> std::io::Result<()>
 where
     F: FnOnce(&mut dyn Write) -> std::io::Result<()>,
@@ -144,10 +129,9 @@ mod tests {
 
     #[test]
     fn a_reader_holding_the_old_file_still_sees_all_of_it() {
-        // The property that makes this atomic: the rename gives the destination
-        // a NEW inode, so a reader that opened the old one keeps reading the
-        // whole old file. `fs::write` truncates in place, and that reader would
-        // see the file shrink under it.
+        // What makes this atomic: the rename gives the destination a new inode, so
+        // a reader that opened the old one keeps reading the whole old file. With
+        // `fs::write` that reader would see the file shrink under it.
         let dir = scratch("reader");
         let path = dir.join("index.bin");
         let old = vec![b'O'; 64 * 1024];

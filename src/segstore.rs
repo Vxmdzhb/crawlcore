@@ -1,110 +1,89 @@
 //! An append-only segment store: immutable numbered segments plus a small
 //! manifest, with compaction.
 //!
-//! # What goes wrong without this
+//! # Why
 //!
-//! Every engine in this suite persists its index the same way — build the whole
-//! thing in memory, serialise it to one blob, publish the blob to one file
-//! (`Index::snapshot()` → [`crate::atomicfile::write_atomic`]) — and loads it by
-//! parsing that blob back. [`crate::atomicfile`] already made the *file* safe: a
-//! torn write can no longer destroy the previous good index. What it cannot fix
-//! is that there is only ever one write, of everything, at one moment. Four
-//! separate problems fall out of that single decision:
+//! The engines used to persist their index as one blob: build everything in
+//! memory, serialise it, publish it with [`crate::atomicfile::write_atomic`].
+//! That keeps the file safe, but there is only ever one write, of everything,
+//! at one moment, and that causes four problems:
 //!
-//! 1. **A save briefly doubles memory.** The index is resident *and* the
-//!    serialised copy of it is resident, at the same time, because `write_atomic`
-//!    wants a finished `&[u8]`. An 800 MB index needs 1.6 GB to save.
-//! 2. **Every save rewrites everything.** A crawl that adds 100 documents to a
-//!    1 000 000-document index writes 1 000 000 documents back out. The cost of a
-//!    save is a function of the corpus, not of the change — which is *why* saves
-//!    are periodic and coarse instead of continuous.
-//! 3. **A crash between saves loses everything since the last one.** The file is
-//!    never corrupt, and that is not the same as safe: kill a six-hour crawl five
-//!    minutes before its single terminal save and six hours are gone.
-//! 4. **You cannot usefully resume.** "Continue where you left off" means reading
-//!    the world back in and writing the world back out, so nobody does it; runs
-//!    are one-shot and restarting means starting over.
+//! 1. **A save briefly doubles memory.** The index and its serialised copy are
+//!    both resident, because `write_atomic` wants a finished `&[u8]`. An
+//!    800 MB index needs 1.6 GB to save.
+//! 2. **Every save rewrites everything.** Adding 100 documents to a
+//!    1 000 000-document index writes a million documents, so saves have to be
+//!    rare and coarse.
+//! 3. **A crash between saves loses everything since the last one.** Kill a
+//!    six-hour crawl five minutes before its final save and six hours are gone.
+//! 4. **Resuming isn't practical.** It means reading the world back in and
+//!    writing it all out again, so runs are one-shot.
 //!
-//! A segment store fixes 2, 3 and 4 outright and 1 partially (see
-//! [Honest limits](#honest-limits)). It is the standard log-structured shape:
+//! A segment store fixes 2, 3 and 4 outright and 1 partly (see
+//! [Limits](#limits)). It's the standard log-structured shape:
 //!
-//! - A **segment** is an immutable file. It is written exactly once, by
-//!   [`crate::atomicfile::write_atomic_with`], holds one batch of records, and is
-//!   never opened for writing again. Immutability is what makes a reader safe
-//!   without a lock: nothing can change under it.
-//! - A **manifest** is a small text file naming the live segments **in order**,
-//!   oldest first, plus a generation number. Committing a batch is: write the
-//!   segment, fsync it, then publish a new manifest. Because the manifest is
-//!   small, a commit costs a segment write plus a few hundred bytes — so commits
-//!   can be *frequent*, which is the whole point of problem 3.
-//! - **Reads** merge the live segments **newest-first**: a record in a later
+//! - A **segment** is an immutable file, written once by
+//!   [`crate::atomicfile::write_atomic_with`], holding one batch of records.
+//!   Since nothing ever changes it, readers need no lock.
+//! - A **manifest** is a small text file naming the live segments **in
+//!   order**, oldest first, plus a generation number. Committing a batch means:
+//!   write the segment, fsync it, publish a new manifest. A commit costs one
+//!   segment write plus a few hundred bytes, so commits can be frequent.
+//! - **Reads** merge the live segments **newest first**: a record in a later
 //!   segment shadows the same key in an earlier one, and a **tombstone**
 //!   ([`Batch::delete`]) shadows it with nothing.
-//! - **Compaction** ([`Store::compact`], [`Store::start_merge`]) folds the oldest
-//!   run of segments into one, dropping shadowed and tombstoned records, and
-//!   commits a manifest naming the result in their place. The old segments are
-//!   deleted only *after* a manifest that does not name them is durable — and
-//!   even then, one generation late (see [`Store::sweep`]).
-//! - **Recovery** is: read the newest manifest that parses, open the segments it
-//!   names. A segment file the manifest does not name is a crashed writer's
-//!   debris; it is ignored, and [`Store::sweep`] removes it.
+//! - **Compaction** ([`Store::compact`], [`Store::start_merge`]) folds the
+//!   oldest run of segments into one, dropping shadowed and deleted records,
+//!   and commits a manifest naming the result in their place. Old segments are
+//!   deleted only once a manifest without them is durable, and one generation
+//!   later than that (see [`Store::sweep`]).
+//! - **Recovery** reads the newest manifest that parses and opens the segments
+//!   it names. A segment file no manifest names is a crashed writer's debris:
+//!   it's ignored, and [`Store::sweep`] removes it.
 //!
-//! # Why the crash window closes
-//!
-//! The ordering is the guarantee, and it is worth stating exactly:
+//! # Why a crash loses at most one batch
 //!
 //! ```text
 //! write segment file  → fsync file → fsync dir      (atomicfile::write_atomic_with)
 //! write manifest file → fsync file → fsync dir      (atomicfile::write_atomic)
 //! ```
 //!
-//! A manifest is therefore *never* durable before the segments it names. Crash at
-//! any instant and the newest durable manifest names only segments that are fully
-//! on disk, so recovery is total for every batch that committed and total *loss*
-//! for the batch in flight. "You lose at most the batch you were writing" is not
-//! a hope about timing; it is a consequence of the fsync order.
+//! A manifest is never durable before the segments it names. Crash at any
+//! moment and the newest durable manifest names only segments fully on disk:
+//! every committed batch survives in full, and the batch in flight is lost in
+//! full. That follows from the fsync order, not from timing.
 //!
-//! # Honest limits
+//! # Limits
 //!
-//! This is a real store, not a marketing document. What it does **not** buy:
-//!
-//! - **Compaction is a fold, not a level.** [`Store::compact`] merges a *prefix*
-//!   of the manifest — the oldest N segments — so write amplification is the
-//!   classic un-levelled kind: fold the base segment repeatedly and you rewrite
-//!   it each time. A real LSM would put segments in size tiers. This does not,
-//!   and a store with a very large base and a fast writer will spend real I/O
-//!   re-folding it. The prefix restriction is also load-bearing for correctness,
-//!   not just simplicity: because the run starts at the *oldest* segment, a
-//!   tombstone inside it has nothing older left to shadow and can be dropped. A
-//!   middle run would have to carry its tombstones forward, and this code would
-//!   get that wrong before it got it right.
-//! - **"Background" is precise, and narrow.** [`Store::start_merge`] moves the
-//!   expensive half — reading the old segments, folding them, writing the new
-//!   segment — onto a `std::thread`. The cheap half, swapping the manifest, still
-//!   happens on the owning thread in [`Store::finish_merge`], and takes about as
-//!   long as one small file write. It is not a daemon: nothing polls, nothing
-//!   merges unless a caller asks. [`Store::compact`] is the same work done
-//!   synchronously, and is what the tests mostly use because it is deterministic.
-//! - **The read path is bounded; a caller that folds into a `HashMap` is not.**
-//!   [`Reader::for_each`] is a true k-way merge over per-segment iterators: it
-//!   holds one decoded record and one 8 KiB buffer per *segment*, never a
-//!   corpus's worth, and [`Reader::peak_resident_bytes`] reports the high-water
-//!   mark so that claim is an assertion rather than a sentence. But the store
-//!   cannot make the caller streaming. `websearch` rebuilds a fully-resident
-//!   `Index` from the stream because its BM25 pass needs the whole corpus in
-//!   memory anyway; see `websearch::segindex` for why that is the right trade
-//!   *there* and why it means problem 1 above is only half-solved for that
-//!   engine. Halved, though, is real: the *save* side no longer doubles, because
-//!   a batch — not the corpus — is what has to be resident to be written.
-//! - **One writer.** There is no lock file and no cross-process mutual exclusion.
-//!   Two processes committing to the same directory will both allocate segment
-//!   ids from the manifest they read and one will lose. The suite's engines have
-//!   a single writer process by construction; if that ever stops being true this
-//!   needs an `O_EXCL` lock, and until then a lock file would be decoration.
-//! - **No point lookup.** Segments are sorted by key, so a binary search over a
-//!   per-segment index block is the obvious next step, but there is no index
-//!   block: everything here is a scan. This store is built for "load it all back
-//!   at startup", which is what the engines actually do.
+//! - **Compaction is a fold, not levels.** [`Store::compact`] merges a
+//!   *prefix* of the manifest (the oldest N segments), so write amplification
+//!   is the un-levelled kind: folding the base segment repeatedly rewrites it
+//!   each time. A proper LSM would use size tiers. The prefix restriction also
+//!   matters for correctness: the run starts at the oldest segment, so a
+//!   tombstone in it has nothing older to shadow and can be dropped. A run in
+//!   the middle would have to carry its tombstones forward.
+//! - **"Background" is narrow.** [`Store::start_merge`] moves the expensive
+//!   half (reading, folding and writing the new segment) onto a
+//!   `std::thread`. Swapping the manifest still happens on the owning thread
+//!   in [`Store::finish_merge`] and costs about one small file write. Nothing
+//!   merges unless a caller asks. [`Store::compact`] does the same work
+//!   synchronously, and the tests mostly use it because it's deterministic.
+//! - **The read path is bounded; a caller folding into a `HashMap` isn't.**
+//!   [`Reader::for_each`] is a true k-way merge: it holds one decoded record
+//!   and one 8 KiB buffer per *segment*, and [`Reader::peak_resident_bytes`]
+//!   reports the high-water mark so the tests can assert it. But `websearch`
+//!   rebuilds a fully resident `Index` from the stream, because BM25 needs the
+//!   whole corpus in memory anyway (see `websearch::segindex`), so for that
+//!   engine problem 1 is only half solved: saving no longer doubles memory,
+//!   because only a batch has to be resident to be written.
+//! - **One writer.** There's no lock file. Two processes committing to the
+//!   same directory would both allocate segment ids from the manifest they
+//!   read, and one would lose. The engines have a single writer process; if
+//!   that changes, this needs an `O_EXCL` lock.
+//! - **No point lookups.** Segments are sorted by key, so a per-segment index
+//!   block for binary search is the obvious next step, but there isn't one:
+//!   everything is a scan. The store is built for "load it all at startup",
+//!   which is what the engines do.
 //!
 //! # Format
 //!
@@ -117,9 +96,9 @@
 //! "ASTRXEND" count:u64 crc32:u32                footer, crc over everything before it
 //! ```
 //!
-//! Manifest (`manifest-<generation, 20 digits>`) is **text**, deliberately: it is
-//! the one file an operator reads at 3am to find out what the store thinks it
-//! has, and `cat` should be enough.
+//! The manifest (`manifest-<generation, 20 digits>`) is **text**, on purpose:
+//! it's the file an operator reads to see what the store thinks it has, and
+//! `cat` should be enough.
 //!
 //! ```text
 //! ASTRX-SEGSTORE 1
@@ -179,29 +158,27 @@ const READ_BUF: usize = 8 << 10;
 // The record trait
 // ---------------------------------------------------------------------------
 
-/// What a segment store needs to know about the thing it is storing.
+/// What a segment store needs to know about what it stores.
 ///
-/// Deliberately three methods. The framing (lengths, ordering, checksums,
-/// tombstones) is the store's problem; the record only has to say who it is and
-/// how to turn into and out of bytes.
+/// Three methods. Framing (lengths, order, checksums, tombstones) is the
+/// store's job; a record only says who it is and how to turn into and out of
+/// bytes.
 ///
-/// [`Record::encode`] appends into a buffer the store owns rather than returning
-/// a `Vec`, so writing a batch of 10 000 records is not 10 000 allocations;
-/// [`Record::decode`] is handed the exact frame payload, so it never has to be
-/// self-delimiting and can be a straight field-by-field read.
+/// [`Record::encode`] appends to a buffer the store owns rather than returning
+/// a `Vec`, so writing 10 000 records isn't 10 000 allocations;
+/// [`Record::decode`] gets exactly the frame's payload, so it never has to be
+/// self-delimiting.
 ///
 /// # Contract
 ///
-/// - [`Record::key`] must be deterministic. It is called once, when the record
-///   enters a [`Batch`], and the returned bytes are what the store stores,
-///   orders and shadows by. A key that changes between calls does not corrupt a
-///   segment, but it does mean the record you read back is filed under a name you
-///   no longer compute.
-/// - `decode(encode(r))` must reproduce `r`. Nothing checks this; the
-///   round-trip tests in each adopting engine are what does.
+/// - [`Record::key`] must be deterministic. It's called once, when the record
+///   enters a [`Batch`], and those bytes are what the store stores, orders and
+///   shadows by.
+/// - `decode(encode(r))` must reproduce `r`. Nothing here checks it; each
+///   engine's round-trip tests do.
 pub trait Record: Sized {
-    /// This record's identity. A record in a later segment shadows an earlier
-    /// record with the same key; a tombstone with this key deletes it.
+    /// This record's identity. A record in a later segment shadows an earlier one
+    /// with the same key; a tombstone with this key deletes it.
     fn key(&self) -> Vec<u8>;
 
     /// Append this record's bytes to `out`.
@@ -425,10 +402,10 @@ pub struct Manifest {
     /// manifest" is a directory listing rather than a pointer file to keep
     /// consistent.
     pub generation: u64,
-    /// Live segments, **oldest first**. Order is the shadowing order and is a
-    /// property of this list, *not* of the ids: compaction gives the merged
-    /// segment a fresh (higher) id but puts it back where the run it replaced
-    /// was, so sorting by id would silently invert which record wins.
+    /// Live segments, **oldest first**. This order is the shadowing order and
+    /// belongs to the list, *not* to the ids: compaction gives the merged segment
+    /// a new (higher) id but puts it where the run it replaced was, so sorting by
+    /// id would invert which record wins.
     pub segments: Vec<SegmentInfo>,
 }
 
@@ -801,16 +778,16 @@ fn verify_segment(path: &Path, info: &SegmentInfo) -> Result<()> {
     Ok(())
 }
 
-/// Read whatever prefix of a damaged segment is intact.
-///
-/// Used only by [`Store::open_recovering`]. Frames are decoded until one runs off
-/// the end or fails to make sense; everything before that is returned. This is a
-/// salvage operation and is *not* automatic — losing the tail of a segment
-/// silently is how you end up debugging a search result that was never indexed.
 /// A frame recovered from a damaged segment: its key, and its value bytes
-/// uninterpreted. Salvage deliberately does not know the record type.
+/// uninterpreted. Salvage doesn't know the record type.
 type SalvagedFrame = (Vec<u8>, Item<Vec<u8>>);
 
+/// Read whatever prefix of a damaged segment is intact.
+///
+/// Used only by [`Store::open_recovering`]. Frames are decoded until one runs
+/// off the end or stops making sense; everything before that is returned. This
+/// is salvage, and never automatic: silently losing the tail of a segment is
+/// how you end up debugging a search result that was never indexed.
 fn salvage_segment(path: &Path) -> Result<Vec<SalvagedFrame>> {
     let bytes = std::fs::read(path).map_err(|e| io_err(path, e))?;
     if bytes.len() < SEG_HEADER_LEN as usize || &bytes[..8] != SEG_MAGIC {
@@ -1060,19 +1037,18 @@ impl<R: Record> Store<R> {
     /// Open (or create) the store in `dir`, strictly.
     ///
     /// Reads the newest manifest that parses and whose segments are all present
-    /// and intact. An empty or non-existent directory is a valid empty store at
-    /// generation 0 — "nothing has been written yet" is not an error.
+    /// and intact. An empty or missing directory is a valid empty store at
+    /// generation 0.
     ///
-    /// Every segment named by the chosen manifest is fully verified (size, record
-    /// count, CRC) before this returns, because open is exactly when you want to
-    /// find out that the last crash left something half-written. That costs one
-    /// streaming pass over the data and a fixed 64 KiB.
+    /// Every segment the chosen manifest names is fully verified (size, record
+    /// count, CRC) before this returns: opening is when you want to learn that
+    /// the last crash left something half-written. That costs one streaming pass
+    /// over the data and a fixed 64 KiB.
     ///
     /// # Errors
     /// [`Error::NoUsableManifest`] if manifests exist but none loads;
-    /// [`Error::Corrupt`] if the newest loadable manifest names a damaged
-    /// segment (use [`Store::open_recovering`] to salvage instead); I/O errors
-    /// otherwise.
+    /// [`Error::Corrupt`] if the newest loadable manifest names a damaged segment
+    /// (use [`Store::open_recovering`] to salvage instead); I/O errors otherwise.
     pub fn open(dir: impl AsRef<Path>) -> Result<Store<R>> {
         Self::open_inner(dir.as_ref(), false).map(|(s, _)| s)
     }
@@ -1313,17 +1289,15 @@ impl<R: Record> Store<R> {
 
     /// Drop every record: commit a manifest that names no segments.
     ///
-    /// One small atomic write, whatever the store's size. It exists because
-    /// "replace the contents wholesale" is a real operation — importing a blob
-    /// snapshot, rebuilding after a format change — and doing it by writing a new
-    /// full batch on top of the old one is *wrong*, not merely wasteful: any key
-    /// the new contents happen not to mention keeps its old value, visible
-    /// forever from an older segment. A caller that means "replace" has to be
-    /// able to say so.
+    /// One small atomic write, whatever the store's size. "Replace the contents"
+    /// is a real operation (importing a blob snapshot, rebuilding after a format
+    /// change), and writing a full new batch on top of the old one would be
+    /// *wrong*: any key the new contents don't mention would keep its old value
+    /// from an older segment.
     ///
-    /// The old segments stay on disk until [`Store::sweep`] takes them, and for a
-    /// generation beyond that, so an in-flight reader is unaffected and the
-    /// previous manifest remains a usable fallback.
+    /// The old segments stay on disk until [`Store::sweep`] takes them, and one
+    /// generation beyond, so in-flight readers are unaffected and the previous
+    /// manifest stays usable as a fallback.
     ///
     /// # Errors
     /// I/O errors writing the manifest.
@@ -1336,11 +1310,12 @@ impl<R: Record> Store<R> {
     }
 
     /// Open the newest published generation without creating, repairing or
-    /// sweeping files. Corruption is an error; readers never roll back silently.
+    /// sweeping anything. Corruption is an error; readers never roll back
+    /// silently.
     ///
     /// # Errors
-    /// I/O errors or an invalid latest manifest. Record integrity is checked by
-    /// the returned reader while scanning.
+    /// I/O errors or an invalid latest manifest. The returned reader checks
+    /// record integrity while scanning.
     pub fn read_snapshot(dir: impl AsRef<Path>) -> Result<Reader<R>> {
         let dir = dir.as_ref();
         let manifest = match list_manifests(dir)?.into_iter().max() {
@@ -1427,7 +1402,7 @@ impl<R: Record> Store<R> {
     /// Fold the oldest `count` segments into one, synchronously.
     ///
     /// Returns `None` if there is nothing worth folding (fewer than two segments,
-    /// or `count < 2`). See the [module docs](self#honest-limits) for why the run
+    /// or `count < 2`). See the [module docs](self#limits) for why the run
     /// is always a prefix and what that costs.
     ///
     /// # Errors
@@ -1500,18 +1475,18 @@ impl<R: Record> Store<R> {
         })
     }
 
-    /// Delete files no retained manifest refers to, returning how many went.
+    /// Delete files no retained manifest refers to, and return how many.
     ///
-    /// Two kinds of debris: segments a crashed writer left before it could commit
-    /// a manifest naming them, and segments a compaction retired. Neither is ever
-    /// deleted while a *retained* manifest still names it, which is what keeps the
-    /// fallback in [`Store::open`] pointing at something real. Readers are safe
-    /// regardless — they hold descriptors, and an unlinked file stays readable.
+    /// Two kinds of debris: segments a crashed writer left before committing a
+    /// manifest naming them, and segments a compaction retired. Nothing is
+    /// deleted while a *retained* manifest still names it, so the fallback in
+    /// [`Store::open`] always points at something real. Readers are safe anyway:
+    /// they hold descriptors, and an unlinked file stays readable.
     ///
     /// # Errors
-    /// I/O errors listing the directory. Failing to remove an individual file is
-    /// not an error: a sweep is best-effort housekeeping, and the store is
-    /// correct with debris in it.
+    /// I/O errors listing the directory. Failing to remove a single file isn't an
+    /// error: sweeping is best-effort housekeeping, and the store is correct with
+    /// debris in it.
     pub fn sweep(&mut self) -> Result<usize> {
         let mut keep_segments: std::collections::BTreeSet<u64> =
             self.manifest.segments.iter().map(|s| s.id).collect();
@@ -1613,13 +1588,13 @@ fn run_merge<R: Record>(spec: MergeJobSpec) -> Result<MergeProduct> {
     // collected is the *surviving* set — shadowed versions and tombstones are
     // already gone — and it is the same set that was resident when the batches
     // were written. Streaming this too would need a producer/consumer channel and
-    // buy a constant factor; the honest note is here rather than in a claim.
+    // buy only a constant factor.
     let mut kept: Vec<(Vec<u8>, Item<R>)> = Vec::new();
     reader.for_each_resolved(|key, item| {
-        // A prefix run has nothing older behind it, so a tombstone here is
-        // deleting something that no longer exists anywhere. Dropping it is the
-        // space compaction reclaims — and is only sound *because* the run is a
-        // prefix. See the module docs.
+        // A prefix run has nothing older behind it, so a tombstone here deletes
+        // something that no longer exists anywhere. Dropping it is the space
+        // compaction reclaims, and it's only sound because the run is a prefix (see
+        // the module docs).
         if let Some(r) = item {
             kept.push((key.to_vec(), Item::Put(r)));
         }
@@ -1659,15 +1634,14 @@ impl<R: Record> MergeJob<R> {
 }
 
 impl<R: Record + 'static> Store<R> {
-    /// Start a compaction of the oldest `count` segments on a background thread.
+    /// Start compacting the oldest `count` segments on a background thread.
     ///
-    /// The thread does the reading, folding and writing; the manifest swap waits
-    /// for [`Store::finish_merge`] on this thread and costs one small file write.
-    /// The writer can keep committing batches while it runs — new segments get
-    /// higher ids and land after the run being folded, so the prefix the merge
-    /// captured stays the prefix.
+    /// The thread reads, folds and writes; the manifest swap waits for
+    /// [`Store::finish_merge`] on this thread and costs one small file write. The
+    /// writer can keep committing batches meanwhile: new segments get higher ids
+    /// and land after the run being folded, so the merge's prefix stays a prefix.
     ///
-    /// Returns `None` when there is nothing worth folding.
+    /// Returns `None` when there's nothing worth folding.
     ///
     /// # Errors
     /// I/O errors preparing the job.

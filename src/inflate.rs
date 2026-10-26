@@ -1,18 +1,15 @@
-//! A dependency-free DEFLATE (RFC 1951) decompressor, with zlib (RFC 1950) and
-//! gzip (RFC 1952) wrappers.
+//! A dependency-free DEFLATE (RFC 1951) decompressor, with zlib (RFC 1950)
+//! and gzip (RFC 1952) wrappers.
 //!
-//! Used to decode `Content-Encoding: gzip`/`deflate` HTTP responses without a
-//! third-party crate (`flate2`), keeping the suite's zero-dep invariant. The
-//! decoder is a faithful Rust port of the algorithm in zlib's reference `puff.c`
-//! (Mark Adler, public domain); cross-checked byte-identical against Python's
-//! `zlib` in `tests/xcheck_inflate.rs`.
+//! Decodes `Content-Encoding: gzip`/`deflate` responses without a third-party
+//! crate. A Rust port of the algorithm in zlib's reference `puff.c` (Mark
+//! Adler, public domain), cross-checked byte for byte against Python's `zlib`
+//! in `tests/xcheck_inflate.rs`.
 //!
-//! Every entry point takes a `max_out` cap on the *decompressed* size and returns
-//! `(bytes, truncated)`: a decompression bomb (a tiny input expanding without
-//! bound) is stopped at the cap with `truncated == true`, never exhausting
-//! memory. Trailing checksums (gzip CRC-32 / ISIZE, zlib Adler-32) are parsed
-//! past but not verified — the crawler wants the content, not integrity, and the
-//! decoded bytes are what the cross-check pins.
+//! Every entry point takes a `max_out` cap on the *decompressed* size and
+//! returns `(bytes, truncated)`, so a decompression bomb stops at the cap with
+//! `truncated == true`. Trailing checksums (gzip CRC-32 / ISIZE, zlib
+//! Adler-32) are read past but not verified: the crawler wants the content.
 
 use std::fmt;
 
@@ -88,12 +85,9 @@ impl Huffman {
     }
 
     /// Kraft-inequality slack: `0` = complete, `> 0` = incomplete, `< 0` =
-    /// over-subscribed. This is what puff's `construct` returns and what the
-    /// port originally dropped on the floor — without it crawlcore happily
-    /// decoded streams every real decoder rejects. Concretely, the 13-byte
-    /// over-subscribed stream `05 c0 01 09 00 00 00 80 20 fb 7f 5a 04` returned
-    /// `Ok([0x00])` here while Python's zlib raised "invalid literal/lengths
-    /// set" — a content differential a hostile origin can aim at the indexer.
+    /// over-subscribed, as puff's `construct` returns it. An over-subscribed code
+    /// must be rejected, as every real decoder does; accepting it would let a
+    /// hostile origin show the indexer different content from what browsers see.
     fn slack(&self) -> i32 {
         let mut left: i32 = 1;
         for len in 1..=MAXBITS {
@@ -385,12 +379,9 @@ pub fn inflate_zlib(data: &[u8], max_out: usize) -> Result<(Vec<u8>, bool), Infl
     if (u16::from(cmf) * 256 + u16::from(flg)) % 31 != 0 {
         return Err(InflateError("zlib: bad header check".to_string()));
     }
-    // FDICT set => the stream needs a preset dictionary we do not have, so it
-    // cannot be decoded. Stepping over the 4-byte dict id and inflating anyway
-    // (what this used to do) produced plausible-looking output for a stream
-    // Python's `zlib.decompress` rejects with "Error 2 while decompressing" —
-    // the same accept-where-everyone-else-refuses family as an over-subscribed
-    // Huffman table.
+    // FDICT set: the stream needs a preset dictionary we don't have, so it can't
+    // be decoded. Refuse it, like Python's `zlib.decompress` does, rather than
+    // producing plausible-looking output.
     if flg & 0x20 != 0 {
         return Err(InflateError(
             "zlib: preset dictionary required (FDICT)".to_string(),
@@ -400,13 +391,12 @@ pub fn inflate_zlib(data: &[u8], max_out: usize) -> Result<(Vec<u8>, bool), Infl
 }
 
 /// Inflate a gzip (RFC 1952) stream: a variable-length header (magic, method,
-/// flags, and any FEXTRA/FNAME/FCOMMENT/FHCRC fields), the DEFLATE body, and an
-/// 8-byte CRC-32/ISIZE trailer (parsed past, not verified).
+/// flags and any FEXTRA/FNAME/FCOMMENT/FHCRC fields), the DEFLATE body, and an
+/// 8-byte CRC-32/ISIZE trailer (read past, not verified).
 ///
-/// gzip files may hold **several concatenated members**, and `gzip.decompress`
-/// returns all of them joined; decoding only the first — what this used to do,
-/// silently and with `truncated == false` — let an origin hide half a page from
-/// the indexer while every browser saw the whole thing.
+/// A gzip file may hold **several concatenated members**, and all of them are
+/// decoded and joined, as `gzip.decompress` and browsers do. Stopping after
+/// the first would let an origin hide part of a page from the indexer.
 ///
 /// # Errors
 /// [`InflateError`] on a bad gzip header or malformed body.
@@ -598,9 +588,8 @@ mod audit_regression {
         .is_err());
     }
 
-    /// gzip files may hold several concatenated members and `gzip.decompress`
-    /// joins them all. Decoding only the first — silently, with
-    /// `truncated == false` — let an origin hide half a page from the indexer.
+    /// A gzip file may hold several concatenated members; all of them must be
+    /// decoded, or an origin could hide part of a page from the indexer.
     #[test]
     fn every_gzip_member_is_decoded_not_just_the_first() {
         let two = unhex(concat!(
