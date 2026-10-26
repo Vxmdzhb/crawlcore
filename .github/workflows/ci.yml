@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The lint bar is a pinned toolchain, as in the suite: clippy changes its
+  # lints between releases, and a bar that moves by itself is not a bar.
+  LINT_TOOLCHAIN: '1.95.0'
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.LINT_TOOLCHAIN }}
+          components: rustfmt
+      - run: cargo fmt --all --check
+        env: { RUSTUP_TOOLCHAIN: '${{ env.LINT_TOOLCHAIN }}' }
+
+  clippy:
+    name: clippy (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ['--no-default-features', '', '--features net', '--all-features']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.LINT_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --locked ${{ matrix.features }} -- -D warnings
+        env: { RUSTUP_TOOLCHAIN: '${{ env.LINT_TOOLCHAIN }}' }
+
+  test:
+    name: tests (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ['--no-default-features', '--all-features']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked ${{ matrix.features }}
+
+  msrv:
+    name: MSRV 1.89
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --all-features
+        env: { RUSTUP_TOOLCHAIN: '1.89.0' }
+
+  zero-deps:
+    name: zero third-party dependencies (default build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The default build resolves to first-party code only
+        run: |
+          set -euo pipefail
+          # First party: this crate, and the suite's own crates, which
+          # Cargo.lock records with a git source in the suite's organisation.
+          first=$( { echo crawlcore; awk -F'"' -v p='git+https://github.com/Vxmdzhb/' \
+            '/^name = /{n=$2} /^source = /{ if (index($2, p) == 1) print n }' Cargo.lock; } | sort -u)
+          tree=$(cargo tree --edges normal --locked --prefix none)
+          third=$(printf '%s\n' "$tree" | awk 'NF {print $1}' | sort -u | grep -vxF "$first" || true)
+          if [ -n "$third" ]; then
+            echo "::error::third-party crates in the default build: $(echo $third)"
+            printf '%s\n' "$tree"
+            exit 1
+          fi
+          echo "default build: first-party only ($(echo $first))"
+
+  deny:
+    name: cargo-deny (bans, licenses, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses sources
+
+  # A RUSTSEC advisory published tomorrow would fail this with no change here;
+  # it reports, it does not gate.
+  advisories:
+    name: cargo-deny (advisories, non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
