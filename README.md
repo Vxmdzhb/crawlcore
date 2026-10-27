@@ -14,3 +14,8 @@ Features: `net`. The default build uses the standard library only; `net` (and `r
 ## History
 
 This repository was split out of https://github.com/Vxmdzhb/astrx-suite with the full history of its files, each followed back through its renames. The cross-check goldens are explained in [GOLDENS.md](GOLDENS.md).
+
+## License
+
+Released under the [Do Whatever License](LICENSE), with a code of conduct
+in the same spirit: [CODE_OF_CONDUCT](CODE_OF_CONDUCT).
